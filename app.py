@@ -1,8 +1,8 @@
-# Full app.py - Dashboard Utilisateurs + Gestion commandes Telegram + Stats cumulatives + Manager React
-# Migrated to SQLAlchemy (works with Postgres via DATABASE_URL or with local sqlite if not provided).
-# Includes full HTML templates embedded.
+# Full app.py - Dashboard Utilisateurs + Gestion commandes Telegram + Stats cumulatives
+# Version mise à jour avec nouveaux prix et catégorie Apple
 
 import os
+import sqlite3
 import requests
 import random
 import traceback
@@ -14,20 +14,14 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Cal
 from functools import wraps
 import threading
 
-# SQLAlchemy imports
-from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, ForeignKey, func
-from sqlalchemy.orm import declarative_base, relationship, sessionmaker, scoped_session
-
-# Configuration
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-# Replace with your admin Telegram IDs
 ADMIN_IDS = [6976573567, 5174507979]
 WEB_PASSWORD = os.getenv('WEB_PASSWORD')
 
 app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', 'votre_secret_key_aleatoire_ici')
 
-# Default in-code configuration (used only for initial population)
+# SERVICES_CONFIG - Version mise à jour
 SERVICES_CONFIG = {
     'netflix': {
         'name': '🎬 Netflix',
@@ -158,176 +152,69 @@ SERVICES_CONFIG = {
     }
 }
 
-# In-memory cache of services (kept for fast access by bot)
-SERVICES_CONFIG_IN_MEMORY = {}
 user_states = {}
 
-# DB config
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_SQLITE_PATH = os.path.join(BASE_DIR, 'orders.db')
-DATABASE_URL = os.getenv('DATABASE_URL') or f"sqlite:///{os.getenv('DB_PATH', DEFAULT_SQLITE_PATH)}"
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not session.get('logged_in'):
+            return redirect('/login')
+        return f(*args, **kwargs)
+    return decorated_function
 
-connect_args = {}
-if DATABASE_URL.startswith('sqlite'):
-    connect_args = {"check_same_thread": False}
-engine = create_engine(DATABASE_URL, connect_args=connect_args, future=True)
-SessionLocal = scoped_session(sessionmaker(bind=engine, expire_on_commit=False))
-Base = declarative_base()
-
-# Models
-class Service(Base):
-    __tablename__ = 'services'
-    service_key = Column(String, primary_key=True)
-    display_name = Column(String)
-    emoji = Column(String)
-    category = Column(String)
-    active = Column(Boolean, default=True)
-    visible = Column(Boolean, default=True)
-    plans = relationship("Plan", back_populates="service", cascade="all, delete-orphan")
-
-class Plan(Base):
-    __tablename__ = 'plans'
-    service_key = Column(String, ForeignKey('services.service_key', ondelete='CASCADE'), primary_key=True)
-    plan_key = Column(String, primary_key=True)
-    label = Column(String)
-    price = Column(Float, default=0.0)
-    cost = Column(Float, default=0.0)
-    service = relationship("Service", back_populates="plans")
-
-class Order(Base):
-    __tablename__ = 'orders'
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, nullable=True)
-    username = Column(String, nullable=True)
-    service = Column(String)
-    plan = Column(String)
-    price = Column(Float)
-    cost = Column(Float)
-    first_name = Column(String, nullable=True)
-    last_name = Column(String, nullable=True)
-    email = Column(String, nullable=True)
-    address = Column(String, nullable=True)
-    payment_method = Column(String, nullable=True)
-    timestamp = Column(String)
-    status = Column(String, default='en_attente')
-    admin_id = Column(Integer, nullable=True)
-    admin_username = Column(String, nullable=True)
-    taken_at = Column(String, nullable=True)
-    cancelled_by = Column(Integer, nullable=True)
-    cancelled_at = Column(String, nullable=True)
-    cancel_reason = Column(String, nullable=True)
-
-class OrderMessage(Base):
-    __tablename__ = 'order_messages'
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    order_id = Column(Integer, index=True)
-    admin_id = Column(Integer)
-    message_id = Column(Integer)
-
-class User(Base):
-    __tablename__ = 'users'
-    user_id = Column(Integer, primary_key=True)
-    username = Column(String)
-    first_name = Column(String)
-    last_name = Column(String)
-    first_seen = Column(String)
-    last_activity = Column(String)
-    total_orders = Column(Integer, default=0)
-
-class CumulativeStats(Base):
-    __tablename__ = 'cumulative_stats'
-    id = Column(Integer, primary_key=True)
-    total_revenue = Column(Float, default=0.0)
-    total_profit = Column(Float, default=0.0)
-    last_updated = Column(String, nullable=True)
-
-# DB init & loaders
+# DATABASE avec table users + statistiques cumulatives
 def init_db():
-    Base.metadata.create_all(bind=engine)
-    session = SessionLocal()
-    try:
-        cs = session.get(CumulativeStats, 1)
-        if not cs:
-            cs = CumulativeStats(id=1, total_revenue=0.0, total_profit=0.0, last_updated=datetime.now().isoformat())
-            session.add(cs)
-            session.commit()
-
-        services_count = session.query(Service).count()
-        if services_count == 0:
-            for sk, sd in SERVICES_CONFIG.items():
-                name = sd.get('name', '')
-                parts = name.split(' ', 1)
-                emoji = parts[0] if len(parts) > 1 else ''
-                display_name = parts[1] if len(parts) > 1 else name or sk
-                svc = Service(service_key=sk, display_name=display_name, emoji=emoji, category=sd.get('category', ''), active=sd.get('active', True), visible=sd.get('visible', True))
-                session.add(svc)
-                for pk, pd in sd.get('plans', {}).items():
-                    plan = Plan(service_key=sk, plan_key=pk, label=pd.get('label', pk), price=float(pd.get('price', 0.0) or 0.0), cost=float(pd.get('cost', 0.0) or 0.0))
-                    svc.plans.append(plan)
-            session.commit()
-
-        if os.getenv('OVERWRITE_DB_FROM_CONFIG', 'false').lower() in ('1', 'true', 'yes'):
-            session.query(Plan).delete()
-            session.query(Service).delete()
-            session.commit()
-            for sk, sd in SERVICES_CONFIG.items():
-                name = sd.get('name', '')
-                parts = name.split(' ', 1)
-                emoji = parts[0] if len(parts) > 1 else ''
-                display_name = parts[1] if len(parts) > 1 else name or sk
-                svc = Service(service_key=sk, display_name=display_name, emoji=emoji, category=sd.get('category', ''), active=sd.get('active', True), visible=sd.get('visible', True))
-                session.add(svc)
-                for pk, pd in sd.get('plans', {}).items():
-                    plan = Plan(service_key=sk, plan_key=pk, label=pd.get('label', pk), price=float(pd.get('price', 0.0) or 0.0), cost=float(pd.get('cost', 0.0) or 0.0))
-                    svc.plans.append(plan)
-            session.commit()
-            print("DB overwritten from SERVICES_CONFIG (OVERWRITE_DB_FROM_CONFIG enabled).")
-
-    except Exception as e:
-        session.rollback()
-        print("init_db error:", e)
-        traceback.print_exc()
-    finally:
-        session.close()
-    load_services_from_db()
-
-def load_services_from_db():
-    global SERVICES_CONFIG_IN_MEMORY
-    session = SessionLocal()
-    try:
-        services = {}
-        svc_rows = session.query(Service).all()
-        for s in svc_rows:
-            services[s.service_key] = {
-                'name': f"{(s.emoji or '').strip()} {s.display_name}".strip(),
-                'active': bool(s.active),
-                'visible': bool(s.visible),
-                'category': s.category or '',
-                'plans': {}
-            }
-        plan_rows = session.query(Plan).all()
-        for p in plan_rows:
-            if p.service_key not in services:
-                continue
-            services[p.service_key]['plans'][p.plan_key] = {
-                'label': p.label,
-                'price': float(p.price or 0.0),
-                'cost': float(p.cost or 0.0)
-            }
-        SERVICES_CONFIG_IN_MEMORY = services
-
-        # Debug log
-        print(f"=== Loaded services from DB (url={DATABASE_URL}) ===")
-        for sk, sd in SERVICES_CONFIG_IN_MEMORY.items():
-            print(f" - {sk}: {sd.get('name')} (active={sd.get('active')}, visible={sd.get('visible')}, category={sd.get('category')})")
-            for pk, pd in sd.get('plans', {}).items():
-                print(f"    plan {pk}: label='{pd.get('label')}', price={pd.get('price')}, cost={pd.get('cost')}")
-        print("=== End loaded services ===")
-    except Exception as e:
-        print("Erreur load_services_from_db:", e)
-        traceback.print_exc()
-    finally:
-        session.close()
+    conn = sqlite3.connect('orders.db', check_same_thread=False)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS orders
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  user_id INTEGER,
+                  username TEXT,
+                  service TEXT,
+                  plan TEXT,
+                  price REAL,
+                  cost REAL,
+                  first_name TEXT,
+                  last_name TEXT,
+                  email TEXT,
+                  address TEXT,
+                  payment_method TEXT,
+                  timestamp TEXT,
+                  status TEXT DEFAULT 'en_attente',
+                  admin_id INTEGER,
+                  admin_username TEXT,
+                  taken_at TEXT,
+                  cancelled_by INTEGER,
+                  cancelled_at TEXT,
+                  cancel_reason TEXT)''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS order_messages
+                 (order_id INTEGER,
+                  admin_id INTEGER,
+                  message_id INTEGER)''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (user_id INTEGER PRIMARY KEY,
+                  username TEXT,
+                  first_name TEXT,
+                  last_name TEXT,
+                  first_seen TEXT,
+                  last_activity TEXT,
+                  total_orders INTEGER DEFAULT 0)''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS cumulative_stats
+                 (id INTEGER PRIMARY KEY CHECK (id = 1),
+                  total_revenue REAL DEFAULT 0,
+                  total_profit REAL DEFAULT 0,
+                  last_updated TEXT)''')
+    
+    c.execute("SELECT COUNT(*) FROM cumulative_stats WHERE id=1")
+    if c.fetchone()[0] == 0:
+        c.execute("INSERT INTO cumulative_stats (id, total_revenue, total_profit, last_updated) VALUES (1, 0, 0, ?)",
+                  (datetime.now().isoformat(),))
+    
+    conn.commit()
+    conn.close()
 
 init_db()
 
@@ -438,7 +325,7 @@ HTML_DASHBOARD = '''<!DOCTYPE html>
             display: flex;
             gap: 10px;
         }
-        .logout-btn, .simulate-btn, .users-btn, .manager-btn {
+        .logout-btn, .simulate-btn, .users-btn {
             background: rgba(255,255,255,0.2);
             color: white;
             padding: 10px 20px;
@@ -446,15 +333,6 @@ HTML_DASHBOARD = '''<!DOCTYPE html>
             border-radius: 8px;
             text-decoration: none;
             cursor: pointer;
-            transition: all 0.3s;
-        }
-        .manager-btn {
-            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-            font-weight: 600;
-        }
-        .manager-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 4px 12px rgba(240, 147, 251, 0.4);
         }
         .simulate-btn {
             background: rgba(255,255,255,0.3);
@@ -642,7 +520,6 @@ HTML_DASHBOARD = '''<!DOCTYPE html>
     <div class="header">
         <h1>🎯 B4U Deals - Dashboard Admin</h1>
         <div class="header-actions">
-            <a href="/manager" class="manager-btn">🎛️ Manager</a>
             <a href="/users" class="users-btn">👥 Utilisateurs</a>
             <a href="/simulate" class="simulate-btn">🎲 Simuler</a>
             <a href="/logout" class="logout-btn">Déconnexion</a>
@@ -996,7 +873,7 @@ HTML_SIMULATE = '''<!DOCTYPE html>
             try {
                 const response = await fetch('/api/simulate', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json'},
+                    headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(data)
                 });
 
@@ -1321,365 +1198,7 @@ HTML_USERS = '''<!DOCTYPE html>
 </html>
 '''
 
-HTML_REACT_MANAGER = '''<!DOCTYPE html>
-<html lang="fr">
-<head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Bot Manager - B4U Deals</title>
-    <style>
-        body { font-family: Arial, Helvetica, sans-serif; background:#f5f7fa; margin:0; padding:20px; }
-        .top { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; }
-        .card { background:white; border-radius:10px; padding:16px; box-shadow:0 6px 18px rgba(0,0,0,0.08); margin-bottom:12px; }
-        .service-header { display:flex; align-items:center; gap:12px; }
-        .emoji { font-size:28px; }
-        .service-actions { margin-left:auto; display:flex; gap:8px; align-items:center; }
-        .plans { margin-top:12px; gap:8px; display:flex; flex-direction:column; }
-        .plan { display:flex; gap:8px; align-items:center; justify-content:space-between; }
-        input[type="text"], input[type="number"], select { padding:8px; border:1px solid #ddd; border-radius:6px; }
-        button { background:#667eea; color:white; border:none; padding:8px 12px; border-radius:8px; cursor:pointer; }
-        button.secondary { background:#10b981; }
-        .small { font-size:13px; color:#666; }
-        label { font-size:13px; color:#333; }
-        .muted { color:#888; font-size:13px; }
-        .save-global { position:fixed; right:20px; bottom:20px; padding:12px 16px; border-radius:12px; background:#f59e0b; color:white; box-shadow:0 8px 30px rgba(0,0,0,0.12); }
-        .danger { background:#ef4444; }
-    </style>
-</head>
-<body>
-    <div class="top">
-        <div>
-            <h1>B4U Bot Manager</h1>
-            <div class="muted">Éditez la configuration des services et plans</div>
-        </div>
-        <div>
-            <a href="/dashboard"><button>← Dashboard</button></a>
-            <button id="addServiceBtn" style="margin-left:8px;">➕ Ajouter service</button>
-        </div>
-    </div>
-
-    <div id="content"></div>
-
-    <button id="saveAll" class="save-global" style="display:none">Sauvegarder les changements</button>
-
-    <script>
-    (function () {
-        const content = document.getElementById('content');
-        const saveAllBtn = document.getElementById('saveAll');
-        const addServiceBtn = document.getElementById('addServiceBtn');
-        let servicesState = {};
-        let hasChanges = false;
-
-        function setDirty(v) {
-            hasChanges = v;
-            saveAllBtn.style.display = v ? 'block' : 'none';
-        }
-
-        addServiceBtn.addEventListener('click', async () => {
-            const key = prompt('Clé du service (ex: myservice) :');
-            if (!key) return;
-            const display_name = prompt('Nom affiché (ex: My Service) :') || key;
-            const emoji = prompt('Emoji (optionnel) :') || '';
-            const category = prompt('Catégorie (ex: streaming, music, ai) :') || '';
-            try {
-                const resp = await fetch('/api/services', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({service_key: key, display_name, emoji, category, active: true, visible: true})
-                });
-                if (!resp.ok) throw new Error('Erreur création service');
-                await loadServices();
-                alert('Service créé');
-            } catch (e) {
-                alert('Erreur: ' + e.message);
-            }
-        });
-
-        async function loadServices() {
-            content.innerHTML = '<div class="card small">Chargement...</div>';
-            try {
-                const res = await fetch('/api/services');
-                const data = await res.json();
-                renderServices(data.services || []);
-            } catch (e) {
-                content.innerHTML = '<div class="card small">Erreur de chargement: ' + e.message + '</div>';
-            }
-        }
-
-        function renderServices(list) {
-            servicesState = {};
-            if (!Array.isArray(list) || list.length === 0) {
-                content.innerHTML = '<div class="card small">Aucun service trouvé</div>';
-                return;
-            }
-            content.innerHTML = '';
-            list.forEach(s => {
-                servicesState[s.service_key] = {
-                    _original: s,
-                    emoji: s.emoji || '',
-                    display_name: s.display_name || '',
-                    active: !!s.active,
-                    visible: !!s.visible,
-                    category: s.category || '',
-                    plans: {}
-                };
-                const card = document.createElement('div');
-                card.className = 'card';
-                card.innerHTML = `
-                    <div class="service-header">
-                        <div class="emoji">${escapeHtml(s.emoji) || '📦'}</div>
-                        <div style="flex:1">
-                            <div><strong class="service-title">${escapeHtml(s.emoji)} ${escapeHtml(s.display_name)}</strong></div>
-                            <div class="small">Clé: <code>${escapeHtml(s.service_key)}</code> · Catégorie: <span class="muted">${escapeHtml(s.category)}</span></div>
-                        </div>
-                        <div class="service-actions">
-                            <label style="font-size:13px"><input type="checkbox" class="active-checkbox" ${s.active ? 'checked' : ''}> Actif</label>
-                            <label style="font-size:13px"><input type="checkbox" class="visible-checkbox" ${s.visible ? 'checked' : ''}> Visible</label>
-                            <button class="btn-delete-service danger" title="Supprimer le service">Supprimer</button>
-                        </div>
-                    </div>
-                    <div style="margin-top:10px;">
-                        <label>Emoji</label><br>
-                        <input type="text" class="input-emoji" value="${escapeHtml(s.emoji)}" style="width:80px;">
-                        <label style="margin-left:12px">Nom affiché</label><br>
-                        <input type="text" class="input-name" value="${escapeHtml(s.display_name)}" style="width:320px;">
-                        <label style="margin-left:12px">Catégorie</label><br>
-                        <input type="text" class="input-category" value="${escapeHtml(s.category)}" style="width:160px;">
-                    </div>
-                    <div class="plans">
-                        <h4 style="margin-top:12px; margin-bottom:6px;">Plans</h4>
-                        <div class="plans-list"></div>
-                        <div style="margin-top:8px;">
-                            <button class="btn-add-plan">➕ Ajouter plan</button>
-                        </div>
-                    </div>
-                `;
-                const plansList = card.querySelector('.plans-list');
-
-                s.plans.forEach(plan => {
-                    servicesState[s.service_key].plans[plan.plan_key] = {
-                        label: plan.label,
-                        price: plan.price,
-                        cost: plan.cost
-                    };
-                    const planRow = document.createElement('div');
-                    planRow.className = 'plan';
-                    planRow.innerHTML = `
-                        <div style="flex:1">
-                            <div><strong>${escapeHtml(plan.plan_key)}</strong> · <span class="small">${escapeHtml(plan.label)}</span></div>
-                            <div class="small">Prix: <input type="number" step="0.01" class="input-price" value="${plan.price}" style="width:90px;"> € &nbsp;&nbsp; Coût: <input type="number" step="0.01" class="input-cost" value="${plan.cost}" style="width:90px;"> €</div>
-                        </div>
-                        <div>
-                            <button class="btn-update-plan secondary">Enregistrer plan</button>
-                            <button class="btn-delete-plan danger" style="margin-left:6px;">Supprimer</button>
-                        </div>
-                    `;
-                    const inputPrice = planRow.querySelector('.input-price');
-                    const inputCost = planRow.querySelector('.input-cost');
-                    const btnUpdatePlan = planRow.querySelector('.btn-update-plan');
-                    const btnDeletePlan = planRow.querySelector('.btn-delete-plan');
-
-                    inputPrice.addEventListener('change', () => {
-                        servicesState[s.service_key].plans[plan.plan_key].price = parseFloat(inputPrice.value) || 0;
-                        setDirty(true);
-                    });
-                    inputCost.addEventListener('change', () => {
-                        servicesState[s.service_key].plans[plan.plan_key].cost = parseFloat(inputCost.value) || 0;
-                        setDirty(true);
-                    });
-
-                    btnUpdatePlan.addEventListener('click', async () => {
-                        btnUpdatePlan.disabled = true;
-                        btnUpdatePlan.textContent = 'Enregistrement...';
-                        try {
-                            const payload = {
-                                label: servicesState[s.service_key].plans[plan.plan_key].label || plan.label,
-                                price: servicesState[s.service_key].plans[plan.plan_key].price,
-                                cost: servicesState[s.service_key].plans[plan.plan_key].cost
-                            };
-                            const resp = await fetch(`/api/services/${encodeURIComponent(s.service_key)}/plans/${encodeURIComponent(plan.plan_key)}`, {
-                                method: 'PUT',
-                                headers: {'Content-Type': 'application/json'},
-                                body: JSON.stringify(payload)
-                            });
-                            if (!resp.ok) throw new Error('Erreur réseau');
-                            btnUpdatePlan.textContent = '✔';
-                            setTimeout(() => btnUpdatePlan.textContent = 'Enregistrer plan', 1000);
-                            setDirty(false);
-                        } catch (e) {
-                            alert('Erreur sauvegarde plan: ' + e.message);
-                            btnUpdatePlan.disabled = false;
-                            btnUpdatePlan.textContent = 'Enregistrer plan';
-                        }
-                    });
-
-                    btnDeletePlan.addEventListener('click', async () => {
-                        if (!confirm('Supprimer ce plan ?')) return;
-                        try {
-                            const resp = await fetch(`/api/services/${encodeURIComponent(s.service_key)}/plans/${encodeURIComponent(plan.plan_key)}`, {
-                                method: 'DELETE'
-                            });
-                            if (!resp.ok) throw new Error('Erreur suppression');
-                            await loadServices();
-                        } catch (e) {
-                            alert('Erreur suppression plan: ' + e.message);
-                        }
-                    });
-
-                    plansList.appendChild(planRow);
-                });
-
-                const inputEmoji = card.querySelector('.input-emoji');
-                const inputName = card.querySelector('.input-name');
-                const inputCategory = card.querySelector('.input-category');
-                const activeCheckbox = card.querySelector('.active-checkbox');
-                const visibleCheckbox = card.querySelector('.visible-checkbox');
-                const btnDeleteService = card.querySelector('.btn-delete-service');
-                const btnAddPlan = card.querySelector('.btn-add-plan');
-
-                function markAndUpdateHeader() {
-                    const titleEl = card.querySelector('.service-title');
-                    titleEl.textContent = (inputEmoji.value || '') + ' ' + (inputName.value || s.display_name);
-                }
-
-                inputEmoji.addEventListener('input', () => {
-                    servicesState[s.service_key].emoji = inputEmoji.value;
-                    markAndUpdateHeader();
-                    setDirty(true);
-                });
-                inputName.addEventListener('input', () => {
-                    servicesState[s.service_key].display_name = inputName.value;
-                    markAndUpdateHeader();
-                    setDirty(true);
-                });
-                inputCategory.addEventListener('input', () => {
-                    servicesState[s.service_key].category = inputCategory.value;
-                    card.querySelector('.muted').textContent = inputCategory.value;
-                    setDirty(true);
-                });
-                activeCheckbox.addEventListener('change', () => {
-                    servicesState[s.service_key].active = activeCheckbox.checked;
-                    setDirty(true);
-                });
-                visibleCheckbox.addEventListener('change', () => {
-                    servicesState[s.service_key].visible = visibleCheckbox.checked;
-                    setDirty(true);
-                });
-
-                btnDeleteService.addEventListener('click', async () => {
-                    if (!confirm('Supprimer ce service (toutes ses données) ?')) return;
-                    try {
-                        const resp = await fetch(`/api/services/${encodeURIComponent(s.service_key)}`, {method: 'DELETE'});
-                        if (!resp.ok) throw new Error('Erreur suppression');
-                        await loadServices();
-                    } catch (e) {
-                        alert('Erreur suppression service: ' + e.message);
-                    }
-                });
-
-                btnAddPlan.addEventListener('click', async () => {
-                    const plan_key = prompt('Clé du plan (ex: 1_mois) :');
-                    if (!plan_key) return;
-                    const label = prompt('Label du plan :') || plan_key;
-                    const price = parseFloat(prompt('Prix (ex: 9.99) :') || '0');
-                    const cost = parseFloat(prompt('Coût (ex: 2.5) :') || '0');
-                    try {
-                        const resp = await fetch(`/api/services/${encodeURIComponent(s.service_key)}/plans`, {
-                            method: 'POST',
-                            headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({plan_key, label, price, cost})
-                        });
-                        if (!resp.ok) throw new Error('Erreur création plan');
-                        await loadServices();
-                    } catch (e) {
-                        alert('Erreur création plan: ' + e.message);
-                    }
-                });
-
-                const saveBtn = document.createElement('button');
-                saveBtn.textContent = 'Sauvegarder service';
-                saveBtn.style.marginLeft = '12px';
-                saveBtn.addEventListener('click', async () => {
-                    saveBtn.disabled = true;
-                    saveBtn.textContent = 'Enregistrement...';
-                    try {
-                        const payload = {
-                            display_name: servicesState[s.service_key].display_name,
-                            emoji: servicesState[s.service_key].emoji,
-                            category: servicesState[s.service_key].category,
-                            active: !!servicesState[s.service_key].active,
-                            visible: !!servicesState[s.service_key].visible
-                        };
-                        const resp = await fetch(`/api/services/${encodeURIComponent(s.service_key)}`, {
-                            method: 'PUT',
-                            headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify(payload)
-                        });
-                        if (!resp.ok) throw new Error('Erreur réseau');
-                        saveBtn.textContent = '✔';
-                        setTimeout(() => saveBtn.textContent = 'Sauvegarder service', 1000);
-                        setDirty(false);
-                    } catch (e) {
-                        alert('Erreur sauvegarde service: ' + e.message);
-                        saveBtn.disabled = false;
-                        saveBtn.textContent = 'Sauvegarder service';
-                    }
-                });
-
-                card.querySelector('.service-actions').appendChild(saveBtn);
-                content.appendChild(card);
-            });
-        }
-
-        saveAllBtn.addEventListener('click', async () => {
-            saveAllBtn.disabled = true;
-            saveAllBtn.textContent = 'Enregistrement...';
-            try {
-                for (const [serviceKey, s] of Object.entries(servicesState)) {
-                    const payload = {
-                        display_name: s.display_name,
-                        emoji: s.emoji,
-                        category: s.category,
-                        active: !!s.active,
-                        visible: !!s.visible
-                    };
-                    await fetch(`/api/services/${encodeURIComponent(serviceKey)}`, {
-                        method: 'PUT',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify(payload)
-                    });
-                    for (const [planKey, p] of Object.entries(s.plans)) {
-                        await fetch(`/api/services/${encodeURIComponent(serviceKey)}/plans/${encodeURIComponent(planKey)}`, {
-                            method: 'PUT',
-                            headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify(p)
-                        });
-                    }
-                }
-                alert('✅ Configuration sauvegardée');
-                setDirty(false);
-                await loadServices();
-            } catch (e) {
-                alert('Erreur lors de la sauvegarde: ' + e.message);
-            } finally {
-                saveAllBtn.disabled = false;
-                saveAllBtn.textContent = 'Sauvegarder les changements';
-            }
-        });
-
-        function escapeHtml(str) {
-            if (!str && str !== 0) return '';
-            return String(str).replace(/[&<>"']/g, function(m){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]; });
-        }
-
-        loadServices();
-    })();
-    </script>
-</body>
-</html>
-'''
-
-# ----------------------- Routes & API -----------------------
+# Routes Flask
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
@@ -1709,315 +1228,143 @@ def simulate():
 def users_page():
     return render_template_string(HTML_USERS)
 
-@app.route('/manager')
-@login_required
-def manager_page():
-    return render_template_string(HTML_REACT_MANAGER)
-
-@app.route('/api/reload_services', methods=['POST'])
-@login_required
-def api_reload_services():
-    try:
-        load_services_from_db()
-        return jsonify({'success': True, 'message': 'Services rechargés depuis la DB', 'db': DATABASE_URL})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/services', methods=['GET'])
-@login_required
-def api_services_list():
-    services = []
-    for service_key, service_data in SERVICES_CONFIG_IN_MEMORY.items():
-        plans = []
-        for plan_key, plan_data in service_data.get('plans', {}).items():
-            plans.append({
-                'plan_key': plan_key,
-                'label': plan_data.get('label', plan_key),
-                'price': plan_data.get('price', 0.0),
-                'cost': plan_data.get('cost', 0.0)
-            })
-        name_parts = service_data.get('name', '').split(' ', 1)
-        emoji = name_parts[0] if len(name_parts) > 1 else (service_data.get('name') or '')
-        display_name = name_parts[1] if len(name_parts) > 1 else (service_data.get('name') or service_key)
-        services.append({
-            'service_key': service_key,
-            'emoji': emoji,
-            'display_name': display_name,
-            'active': service_data.get('active', True),
-            'visible': service_data.get('visible', True),
-            'category': service_data.get('category', ''),
-            'plans': plans
-        })
-    return jsonify({'services': services})
-
-@app.route('/api/services', methods=['POST'])
-@login_required
-def api_create_service():
-    data = request.get_json(force=True)
-    service_key = data.get('service_key')
-    display_name = data.get('display_name') or service_key
-    emoji = data.get('emoji') or ''
-    category = data.get('category') or ''
-    active = bool(data.get('active', True))
-    visible = bool(data.get('visible', True))
-    if not service_key:
-        return jsonify({'error': 'service_key_required'}), 400
-    session = SessionLocal()
-    try:
-        existing = session.get(Service, service_key)
-        if existing:
-            return jsonify({'error': 'service_exists'}), 409
-        svc = Service(service_key=service_key, display_name=display_name, emoji=emoji, category=category, active=active, visible=visible)
-        session.add(svc)
-        session.commit()
-    except Exception as e:
-        session.rollback()
-        return jsonify({'error': 'db_error', 'detail': str(e)}), 500
-    finally:
-        session.close()
-    load_services_from_db()
-    return jsonify({'success': True})
-
-@app.route('/api/services/<service_key>', methods=['PUT'])
-@login_required
-def api_update_service(service_key):
-    data = request.get_json(force=True)
-    display_name = data.get('display_name') or ''
-    emoji = data.get('emoji') or ''
-    category = data.get('category') or ''
-    active = bool(data.get('active', True))
-    visible = bool(data.get('visible', True))
-    session = SessionLocal()
-    try:
-        svc = session.get(Service, service_key)
-        if not svc:
-            return jsonify({'error': 'Service not found'}), 404
-        svc.display_name = display_name
-        svc.emoji = emoji
-        svc.category = category
-        svc.active = active
-        svc.visible = visible
-        session.commit()
-    except Exception as e:
-        session.rollback()
-        return jsonify({'error': 'db_error', 'detail': str(e)}), 500
-    finally:
-        session.close()
-    load_services_from_db()
-    return jsonify({'success': True})
-
-@app.route('/api/services/<service_key>', methods=['DELETE'])
-@login_required
-def api_delete_service(service_key):
-    session = SessionLocal()
-    try:
-        svc = session.get(Service, service_key)
-        if not svc:
-            return jsonify({'error': 'Service not found'}), 404
-        session.delete(svc)
-        session.commit()
-    except Exception as e:
-        session.rollback()
-        return jsonify({'error': 'db_error', 'detail': str(e)}), 500
-    finally:
-        session.close()
-    load_services_from_db()
-    return jsonify({'success': True})
-
-@app.route('/api/services/<service_key>/plans', methods=['POST'])
-@login_required
-def api_create_plan(service_key):
-    data = request.get_json(force=True)
-    plan_key = data.get('plan_key')
-    label = data.get('label') or plan_key
-    price = float(data.get('price', 0) or 0)
-    cost = float(data.get('cost', 0) or 0)
-    if not plan_key:
-        return jsonify({'error': 'plan_key_required'}), 400
-    session = SessionLocal()
-    try:
-        svc = session.get(Service, service_key)
-        if not svc:
-            return jsonify({'error': 'Service not found'}), 404
-        existing = session.query(Plan).filter_by(service_key=service_key, plan_key=plan_key).first()
-        if existing:
-            return jsonify({'error': 'plan_exists'}), 409
-        plan = Plan(service_key=service_key, plan_key=plan_key, label=label, price=price, cost=cost)
-        session.add(plan)
-        session.commit()
-    except Exception as e:
-        session.rollback()
-        return jsonify({'error': 'db_error', 'detail': str(e)}), 500
-    finally:
-        session.close()
-    load_services_from_db()
-    return jsonify({'success': True})
-
-@app.route('/api/services/<service_key>/plans/<plan_key>', methods=['PUT'])
-@login_required
-def api_update_plan(service_key, plan_key):
-    data = request.get_json(force=True)
-    label = data.get('label') if 'label' in data else None
-    price = float(data.get('price')) if 'price' in data and data.get('price') is not None else None
-    cost = float(data.get('cost')) if 'cost' in data and data.get('cost') is not None else None
-    session = SessionLocal()
-    try:
-        plan = session.query(Plan).filter_by(service_key=service_key, plan_key=plan_key).first()
-        if not plan:
-            return jsonify({'error': 'Plan not found'}), 404
-        if label is not None:
-            plan.label = label
-        if price is not None:
-            plan.price = price
-        if cost is not None:
-            plan.cost = cost
-        session.commit()
-    except Exception as e:
-        session.rollback()
-        return jsonify({'error': 'db_error', 'detail': str(e)}), 500
-    finally:
-        session.close()
-    load_services_from_db()
-    return jsonify({'success': True})
-
-@app.route('/api/services/<service_key>/plans/<plan_key>', methods=['DELETE'])
-@login_required
-def api_delete_plan(service_key, plan_key):
-    session = SessionLocal()
-    try:
-        plan = session.query(Plan).filter_by(service_key=service_key, plan_key=plan_key).first()
-        if not plan:
-            return jsonify({'error': 'Plan not found'}), 404
-        session.delete(plan)
-        session.commit()
-    except Exception as e:
-        session.rollback()
-        return jsonify({'error': 'db_error', 'detail': str(e)}), 500
-    finally:
-        session.close()
-    load_services_from_db()
-    return jsonify({'success': True})
-
-# Users / Dashboard / Orders / Simulate endpoints follow same logic as earlier (using SQLAlchemy sessions)
 @app.route('/api/users')
 @login_required
 def api_users():
-    session = SessionLocal()
-    try:
-        total_users = session.query(func.count(User.user_id)).scalar()
-        active_users = session.query(func.count(User.user_id)).filter(User.total_orders > 0).scalar()
-        conversion_rate = (active_users / total_users * 100) if total_users and total_users > 0 else 0
-        seven_days_ago = (datetime.now() - timedelta(days=7)).isoformat()
-        new_users = session.query(func.count(User.user_id)).filter(User.first_seen >= seven_days_ago).scalar()
-        users_q = session.query(User).order_by(User.last_activity.desc()).all()
-        users = []
-        for u in users_q:
-            users.append({
-                'user_id': u.user_id,
-                'username': u.username or 'N/A',
-                'first_name': u.first_name or 'Inconnu',
-                'last_name': u.last_name or '',
-                'first_seen': u.first_seen,
-                'last_activity': u.last_activity,
-                'total_orders': u.total_orders
-            })
-        return jsonify({
-            'stats': {
-                'total_users': total_users,
-                'active_users': active_users,
-                'conversion_rate': round(conversion_rate, 1),
-                'new_users': new_users
-            },
-            'users': users
+    conn = sqlite3.connect('orders.db', check_same_thread=False)
+    c = conn.cursor()
+    
+    c.execute("SELECT COUNT(*) FROM users")
+    total_users = c.fetchone()[0]
+    
+    c.execute("SELECT COUNT(*) FROM users WHERE total_orders > 0")
+    active_users = c.fetchone()[0]
+    
+    conversion_rate = (active_users / total_users * 100) if total_users > 0 else 0
+    
+    seven_days_ago = (datetime.now() - timedelta(days=7)).isoformat()
+    c.execute("SELECT COUNT(*) FROM users WHERE first_seen >= ?", (seven_days_ago,))
+    new_users = c.fetchone()[0]
+    
+    c.execute("""SELECT user_id, username, first_name, last_name, first_seen, last_activity, total_orders
+                 FROM users
+                 ORDER BY last_activity DESC""")
+    
+    users = []
+    for row in c.fetchall():
+        users.append({
+            'user_id': row[0],
+            'username': row[1] or 'N/A',
+            'first_name': row[2] or 'Inconnu',
+            'last_name': row[3] or '',
+            'first_seen': row[4],
+            'last_activity': row[5],
+            'total_orders': row[6]
         })
-    finally:
-        session.close()
+    
+    conn.close()
+    
+    return jsonify({
+        'stats': {
+            'total_users': total_users,
+            'active_users': active_users,
+            'conversion_rate': round(conversion_rate, 1),
+            'new_users': new_users
+        },
+        'users': users
+    })
 
 @app.route('/api/users/<int:user_id>')
 @login_required
 def api_user_details(user_id):
-    session = SessionLocal()
-    try:
-        orders_q = session.query(Order).filter(Order.user_id == user_id).order_by(Order.timestamp.desc()).all()
-        orders = []
-        for o in orders_q:
-            orders.append({
-                'id': o.id,
-                'service': o.service,
-                'plan': o.plan,
-                'price': o.price,
-                'timestamp': o.timestamp,
-                'status': o.status
-            })
-        return jsonify({'orders': orders})
-    finally:
-        session.close()
+    conn = sqlite3.connect('orders.db', check_same_thread=False)
+    c = conn.cursor()
+    
+    c.execute("""SELECT id, service, plan, price, timestamp, status
+                 FROM orders
+                 WHERE user_id=?
+                 ORDER BY timestamp DESC""", (user_id,))
+    
+    orders = []
+    for row in c.fetchall():
+        orders.append({
+            'id': row[0],
+            'service': row[1],
+            'plan': row[2],
+            'price': row[3],
+            'timestamp': row[4],
+            'status': row[5]
+        })
+    
+    conn.close()
+    
+    return jsonify({'orders': orders})
 
 @app.route('/api/dashboard')
 @login_required
 def api_dashboard():
-    session = SessionLocal()
-    try:
-        orders_q = session.query(Order).order_by(Order.id.desc()).all()
-        orders = []
-        for o in orders_q:
-            orders.append({
-                'id': o.id,
-                'username': o.username,
-                'service': o.service,
-                'plan': o.plan,
-                'price': o.price,
-                'cost': o.cost,
-                'first_name': o.first_name,
-                'last_name': o.last_name,
-                'email': o.email,
-                'payment_method': o.payment_method,
-                'status': o.status,
-                'admin_id': o.admin_id,
-                'admin_username': o.admin_username
-            })
-        total = session.query(func.count(Order.id)).scalar()
-        pending = session.query(func.count(Order.id)).filter(Order.status == 'en_attente').scalar()
-        inprogress = session.query(func.count(Order.id)).filter(Order.status == 'en_cours').scalar()
-        completed = session.query(func.count(Order.id)).filter(Order.status == 'terminee').scalar()
-        cumul = session.get(CumulativeStats, 1)
-        revenue = cumul.total_revenue if cumul else 0
-        profit = cumul.total_profit if cumul else 0
-        return jsonify({
-            'orders': orders,
-            'stats': {
-                'total_orders': total,
-                'pending_orders': pending,
-                'inprogress_orders': inprogress,
-                'completed_orders': completed,
-                'revenue': revenue,
-                'profit': profit
-            }
+    conn = sqlite3.connect('orders.db', check_same_thread=False)
+    c = conn.cursor()
+    
+    c.execute("SELECT id, username, service, plan, price, cost, first_name, last_name, email, payment_method, status, admin_id, admin_username FROM orders ORDER BY id DESC")
+    orders = []
+    for row in c.fetchall():
+        orders.append({
+            'id': row[0],
+            'username': row[1],
+            'service': row[2],
+            'plan': row[3],
+            'price': row[4],
+            'cost': row[5],
+            'first_name': row[6],
+            'last_name': row[7],
+            'email': row[8],
+            'payment_method': row[9],
+            'status': row[10],
+            'admin_id': row[11],
+            'admin_username': row[12]
         })
-    finally:
-        session.close()
+    
+    c.execute("SELECT COUNT(*) FROM orders")
+    total = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM orders WHERE status='en_attente'")
+    pending = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM orders WHERE status='en_cours'")
+    inprogress = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM orders WHERE status='terminee'")
+    completed = c.fetchone()[0]
+    
+    c.execute("SELECT total_revenue, total_profit FROM cumulative_stats WHERE id=1")
+    cumul = c.fetchone()
+    revenue = cumul[0] if cumul else 0
+    profit = cumul[1] if cumul else 0
+    
+    conn.close()
+    
+    return jsonify({
+        'orders': orders,
+        'stats': {
+            'total_orders': total,
+            'pending_orders': pending,
+            'inprogress_orders': inprogress,
+            'completed_orders': completed,
+            'revenue': revenue,
+            'profit': profit
+        }
+    })
 
 @app.route('/api/order/<int:order_id>/take', methods=['POST'])
 @login_required
 def take_order(order_id):
-    session = SessionLocal()
-    try:
-        o = session.get(Order, order_id)
-        if not o:
-            return jsonify({'error': 'Order not found'}), 404
-        o.status = 'en_cours'
-        o.admin_id = 999999
-        o.admin_username = 'web_admin'
-        o.taken_at = datetime.now().isoformat()
-        session.commit()
-    except Exception as e:
-        session.rollback()
-        print("take_order error:", e)
-    finally:
-        session.close()
+    conn = sqlite3.connect('orders.db', check_same_thread=False)
+    c = conn.cursor()
+    c.execute("UPDATE orders SET status='en_cours', admin_id=?, admin_username=?, taken_at=? WHERE id=?", 
+              (999999, 'web_admin', datetime.now().isoformat(), order_id))
+    conn.commit()
+    conn.close()
     try:
         delete_other_admin_notifications(order_id, 999999)
-        edit_admin_notification(order_id, 999999, f"🔒 *COMMANDE #{order_id} — PRISE EN CHARGE*\n\n✅ Pris en charge via le dashboard\n🕐 {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+        edit_admin_notification(order_id, 999999, f"🔔 *COMMANDE #{order_id} — PRISE EN CHARGE*\n\n✅ Pris en charge via le dashboard\n🕒 {datetime.now().strftime('%d/%m/%Y %H:%M')}")
     except Exception as e:
         print("Erreur notifications:", e)
     return jsonify({'success': True})
@@ -2025,26 +1372,21 @@ def take_order(order_id):
 @app.route('/api/order/<int:order_id>/complete', methods=['POST'])
 @login_required
 def complete_order(order_id):
-    session = SessionLocal()
+    conn = sqlite3.connect('orders.db', check_same_thread=False)
+    c = conn.cursor()
+    
+    c.execute("SELECT price, cost FROM orders WHERE id=?", (order_id,))
+    row = c.fetchone()
+    if row:
+        price, cost = row
+        c.execute("UPDATE cumulative_stats SET total_revenue = total_revenue + ?, total_profit = total_profit + ?, last_updated = ? WHERE id=1",
+                  (price, price - cost, datetime.now().isoformat()))
+    
+    c.execute("UPDATE orders SET status='terminee' WHERE id=?", (order_id,))
+    conn.commit()
+    conn.close()
     try:
-        o = session.get(Order, order_id)
-        if o:
-            price = o.price or 0.0
-            cost = o.cost or 0.0
-            cs = session.get(CumulativeStats, 1)
-            if cs:
-                cs.total_revenue = (cs.total_revenue or 0.0) + price
-                cs.total_profit = (cs.total_profit or 0.0) + (price - cost)
-                cs.last_updated = datetime.now().isoformat()
-            o.status = 'terminee'
-            session.commit()
-    except Exception as e:
-        session.rollback()
-        print("complete_order error:", e)
-    finally:
-        session.close()
-    try:
-        edit_all_admin_notifications(order_id, f"✅ *COMMANDE #{order_id} — TERMINÉE*\n\nTerminée via le dashboard\n🕐 {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+        edit_all_admin_notifications(order_id, f"✅ *COMMANDE #{order_id} — TERMINÉE*\n\nTerminée via le dashboard\n🕒 {datetime.now().strftime('%d/%m/%Y %H:%M')}")
     except Exception as e:
         print("Erreur notifications:", e)
     return jsonify({'success': True})
@@ -2052,20 +1394,14 @@ def complete_order(order_id):
 @app.route('/api/order/<int:order_id>/cancel', methods=['POST'])
 @login_required
 def cancel_order(order_id):
-    session = SessionLocal()
+    conn = sqlite3.connect('orders.db', check_same_thread=False)
+    c = conn.cursor()
+    c.execute("UPDATE orders SET status='annulee', cancelled_at=? WHERE id=?",
+              (datetime.now().isoformat(), order_id))
+    conn.commit()
+    conn.close()
     try:
-        o = session.get(Order, order_id)
-        if o:
-            o.status = 'annulee'
-            o.cancelled_at = datetime.now().isoformat()
-            session.commit()
-    except Exception as e:
-        session.rollback()
-        print("cancel_order error:", e)
-    finally:
-        session.close()
-    try:
-        edit_all_admin_notifications(order_id, f"❌ *COMMANDE #{order_id} — ANNULÉE*\n\nAnnulée via le dashboard\n🕐 {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+        edit_all_admin_notifications(order_id, f"❌ *COMMANDE #{order_id} — ANNULÉE*\n\nAnnulée via le dashboard\n🕒 {datetime.now().strftime('%d/%m/%Y %H:%M')}")
     except Exception as e:
         print("Erreur notifications:", e)
     return jsonify({'success': True})
@@ -2073,27 +1409,21 @@ def cancel_order(order_id):
 @app.route('/api/order/<int:order_id>/restore', methods=['POST'])
 @login_required
 def restore_order(order_id):
-    session = SessionLocal()
-    try:
-        o = session.get(Order, order_id)
-        if o:
-            o.status = 'en_attente'
-            o.admin_id = None
-            o.admin_username = None
-            o.taken_at = None
-            o.cancelled_by = None
-            o.cancelled_at = None
-            session.query(OrderMessage).filter(OrderMessage.order_id == order_id).delete()
-            session.commit()
-    except Exception as e:
-        session.rollback()
-        print("restore_order error:", e)
-    finally:
-        session.close()
+    conn = sqlite3.connect('orders.db', check_same_thread=False)
+    c = conn.cursor()
+    c.execute("UPDATE orders SET status='en_attente', admin_id=NULL, admin_username=NULL, taken_at=NULL, cancelled_by=NULL, cancelled_at=NULL WHERE id=?",
+              (order_id,))
+    conn.commit()
+    
+    c.execute("DELETE FROM order_messages WHERE order_id=?", (order_id,))
+    conn.commit()
+    conn.close()
+    
     try:
         resend_order_to_all_admins(order_id)
     except Exception as e:
         print("Erreur renvoi notifications:", e)
+    
     return jsonify({'success': True})
 
 @app.route('/')
@@ -2113,17 +1443,21 @@ def api_simulate():
             raise ValueError("Corps JSON vide")
     except Exception as e:
         return jsonify({'success': False, 'error': 'invalid_json', 'detail': str(e)}), 400
+
     try:
         count = int(data.get('count', 1))
     except Exception as e:
         return jsonify({'success': False, 'error': 'invalid_count'}), 400
+
     service_filter = data.get('service', 'all')
     status = data.get('status', 'terminee')
+
     first_names = ['Lucas', 'Emma', 'Louis', 'Léa', 'Hugo', 'Chloé', 'Arthur', 'Manon', 'Jules', 'Camille']
     last_names = ['Martin', 'Bernard', 'Dubois', 'Thomas', 'Robert', 'Richard', 'Petit', 'Durand']
     payment_methods = ['PayPal', 'Virement', 'Revolut']
+
     services_list = []
-    for service_key, service_data in SERVICES_CONFIG_IN_MEMORY.items():
+    for service_key, service_data in SERVICES_CONFIG.items():
         for plan_key, plan_data in service_data['plans'].items():
             services_list.append({
                 'key': service_key,
@@ -2133,7 +1467,10 @@ def api_simulate():
                 'price': plan_data['price'],
                 'cost': plan_data['cost']
             })
-    session = SessionLocal()
+
+    conn = sqlite3.connect('orders.db', check_same_thread=False)
+    c = conn.cursor()
+
     created_orders = []
     try:
         for i in range(count):
@@ -2142,187 +1479,94 @@ def api_simulate():
             else:
                 filtered = [s for s in services_list if s['key'] == service_filter]
                 service = random.choice(filtered) if filtered else random.choice(services_list)
+
             first_name = random.choice(first_names)
             last_name = random.choice(last_names)
             email = f"{first_name.lower()}.{last_name.lower()}{random.randint(1, 999)}@email.com"
             user_id = random.randint(100000000, 999999999)
             username = f"user_{random.randint(1000, 9999)}"
             payment_method = random.choice(payment_methods)
+
             days_ago = random.randint(0, 30)
             timestamp = (datetime.now() - timedelta(days=days_ago)).isoformat()
-            user = session.get(User, user_id)
-            if not user:
-                user = User(user_id=user_id, username=username, first_name=first_name, last_name=last_name, first_seen=timestamp, last_activity=timestamp, total_orders=0)
-                session.add(user)
-            user.last_activity = timestamp
-            user.total_orders = (user.total_orders or 0) + 1
+
+            c.execute("""INSERT OR IGNORE INTO users (user_id, username, first_name, last_name, first_seen, last_activity, total_orders)
+                         VALUES (?, ?, ?, ?, ?, ?, 0)""", 
+                      (user_id, username, first_name, last_name, timestamp, timestamp))
+            
+            c.execute("UPDATE users SET last_activity = ?, total_orders = total_orders + 1 WHERE user_id = ?",
+                      (timestamp, user_id))
+
             if service['key'] == 'deezer':
-                o = Order(user_id=user_id, username=username, service=service['name'], plan=service['plan_label'], price=service['price'], cost=service['cost'], timestamp=timestamp, status=status, first_name=last_name, last_name=first_name, email=email)
+                c.execute("""INSERT INTO orders 
+                             (user_id, username, service, plan, price, cost, timestamp, status,
+                              first_name, last_name, email)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                          (user_id, username, service['name'], service['plan_label'],
+                           service['price'], service['cost'], timestamp, status,
+                           first_name, last_name, email))
             else:
-                o = Order(user_id=user_id, username=username, service=service['name'], plan=service['plan_label'], price=service['price'], cost=service['cost'], timestamp=timestamp, status=status, first_name=first_name, last_name=last_name, email=email, payment_method=payment_method)
-            session.add(o)
-            session.flush()
+                c.execute("""INSERT INTO orders 
+                             (user_id, username, service, plan, price, cost, timestamp, status,
+                              first_name, last_name, email, payment_method)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                          (user_id, username, service['name'], service['plan_label'],
+                           service['price'], service['cost'], timestamp, status,
+                           first_name, last_name, email, payment_method))
+
+            order_id = c.lastrowid
+            
             if status == 'terminee':
-                cs = session.get(CumulativeStats, 1)
-                if cs:
-                    cs.total_revenue = (cs.total_revenue or 0.0) + (service['price'] or 0.0)
-                    cs.total_profit = (cs.total_profit or 0.0) + ((service['price'] or 0.0) - (service['cost'] or 0.0))
-                    cs.last_updated = datetime.now().isoformat()
+                c.execute("UPDATE cumulative_stats SET total_revenue = total_revenue + ?, total_profit = total_profit + ?, last_updated = ? WHERE id=1",
+                          (service['price'], service['price'] - service['cost'], datetime.now().isoformat()))
+
             created_orders.append({
-                'id': o.id,
+                'id': order_id,
                 'service': service['name'],
                 'price': service['price']
             })
-        session.commit()
+
+        conn.commit()
+
     except Exception as e:
-        session.rollback()
+        conn.rollback()
         tb = traceback.format_exc()
         print("Erreur génération commandes:", e)
         print(tb)
         return jsonify({'success': False, 'error': 'exception_during_insert', 'detail': str(e)}), 500
+
     finally:
-        session.close()
+        conn.close()
+
     return jsonify({'success': True, 'created': len(created_orders), 'orders': created_orders})
 
-# Helper functions (SQLAlchemy-backed)
+# Helper functions
 def update_user_activity(user_id, username, first_name, last_name):
-    session = SessionLocal()
+    conn = sqlite3.connect('orders.db', check_same_thread=False)
+    c = conn.cursor()
     now = datetime.now().isoformat()
-    try:
-        user = session.get(User, user_id)
-        if user:
-            user.last_activity = now
-            user.username = username
-            user.first_name = first_name
-            user.last_name = last_name
-        else:
-            user = User(user_id=user_id, username=username, first_name=first_name, last_name=last_name, first_seen=now, last_activity=now, total_orders=0)
-            session.add(user)
-        session.commit()
-    except Exception as e:
-        session.rollback()
-        print("update_user_activity error:", e)
-    finally:
-        session.close()
-
-def delete_other_admin_notifications(order_id: int, keeping_admin_id: int):
-    if not BOT_TOKEN:
-        return
-    session = SessionLocal()
-    try:
-        rows = session.query(OrderMessage).filter(OrderMessage.order_id == order_id, OrderMessage.admin_id != keeping_admin_id).all()
-        for om in rows:
-            try:
-                requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage", json={"chat_id": om.admin_id, "message_id": om.message_id}, timeout=10)
-            except Exception as e:
-                print(f"[delete_message] Erreur admin {om.admin_id} msg {om.message_id}: {e}")
-        session.query(OrderMessage).filter(OrderMessage.order_id == order_id, OrderMessage.admin_id != keeping_admin_id).delete()
-        session.commit()
-    except Exception as e:
-        print("Erreur delete_other_admin_notifications:", e)
-    finally:
-        session.close()
-
-def edit_admin_notification(order_id: int, admin_id: int, new_text: str):
-    if not BOT_TOKEN:
-        return
-    session = SessionLocal()
-    try:
-        row = session.query(OrderMessage).filter(OrderMessage.order_id == order_id, OrderMessage.admin_id == admin_id).first()
-        if row:
-            try:
-                requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText", json={"chat_id": admin_id, "message_id": row.message_id, "text": new_text, "parse_mode": "Markdown"}, timeout=10)
-            except Exception as e:
-                print(f"[edit_message] Erreur admin {admin_id} msg {row.message_id}: {e}")
-    except Exception as e:
-        print("Erreur edit_admin_notification:", e)
-    finally:
-        session.close()
-
-def edit_all_admin_notifications(order_id: int, new_text: str):
-    if not BOT_TOKEN:
-        return
-    session = SessionLocal()
-    try:
-        rows = session.query(OrderMessage).filter(OrderMessage.order_id == order_id).all()
-        for om in rows:
-            try:
-                requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText", json={"chat_id": om.admin_id, "message_id": om.message_id, "text": new_text, "parse_mode": "Markdown"}, timeout=10)
-            except Exception as e:
-                print(f"[edit_message] Erreur admin {om.admin_id} msg {om.message_id}: {e}")
-    except Exception as e:
-        print("Erreur edit_all_admin_notifications:", e)
-    finally:
-        session.close()
-
-def resend_order_to_all_admins(order_id: int):
-    if not BOT_TOKEN:
-        return
-    session = SessionLocal()
-    try:
-        o = session.get(Order, order_id)
-        if not o:
-            return
-        admin_text = f"🔔 *COMMANDE #{order_id} REMISE EN LIGNE*\n\n"
-        if o.username:
-            admin_text += f"👤 @{o.username}\n"
-        else:
-            admin_text += f"👤 ID: {o.user_id}\n"
-        admin_text += (f"📦 {o.service}\n" f"📋 {o.plan}\n" f"💰 {o.price}€\n" f"💵 Coût: {o.cost}€\n" f"📈 Bénéf: {(o.price or 0) - (o.cost or 0)}€\n\n" f"👤 {o.first_name} {o.last_name}\n" f"📧 {o.email}\n")
-        if o.payment_method:
-            admin_text += f"💳 {o.payment_method}\n"
-        admin_text += f"\n🕐 {datetime.now().strftime('%d/%m/%Y %H:%M')}"
-
-        keyboard = [[{"text": "✋ Prendre", "callback_data": f"admin_take_{order_id}"}, {"text": "❌ Annuler", "callback_data": f"admin_cancel_{order_id}"}]]
-        for admin_id in ADMIN_IDS:
-            try:
-                response = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id": admin_id, "text": admin_text, "parse_mode": "Markdown", "reply_markup": {"inline_keyboard": keyboard}}, timeout=10)
-                result = response.json()
-                if result.get('ok'):
-                    message_id = result['result']['message_id']
-                    om = OrderMessage(order_id=order_id, admin_id=admin_id, message_id=message_id)
-                    session.add(om)
-            except Exception as e:
-                print(f"Erreur envoi admin {admin_id}: {e}")
-        session.commit()
-    except Exception as e:
-        print("Erreur resend_order_to_all_admins:", e)
-    finally:
-        session.close()
-
-async def resend_order_to_all_admins_async(context, order_id, service_name, plan_label, price, cost, username, user_id, first_name, last_name, email, payment_method):
-    admin_text = f"🔔 *COMMANDE #{order_id} REMISE EN LIGNE*\n\n"
-    if username:
-        admin_text += f"👤 @{username}\n"
+    
+    c.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
+    if c.fetchone():
+        c.execute("UPDATE users SET last_activity=?, username=?, first_name=?, last_name=? WHERE user_id=?",
+                  (now, username, first_name, last_name, user_id))
     else:
-        admin_text += f"👤 ID: {user_id}\n"
-    admin_text += (f"📦 {service_name}\n" f"📋 {plan_label}\n" f"💰 {price}€\n" f"💵 Coût: {cost}€\n" f"📈 Bénéf: {price - cost}€\n\n" f"👤 {first_name} {last_name}\n" f"📧 {email}\n")
-    if payment_method:
-        admin_text += f"💳 {payment_method}\n"
-    admin_text += f"\n🕐 {datetime.now().strftime('%d/%m/%Y %H:%M')}"
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✋ Prendre", callback_data=f"admin_take_{order_id}"), InlineKeyboardButton("❌ Annuler", callback_data=f"admin_cancel_{order_id}")]])
-    session = SessionLocal()
-    try:
-        for admin_id in ADMIN_IDS:
-            try:
-                msg = await context.bot.send_message(chat_id=admin_id, text=admin_text, parse_mode='Markdown', reply_markup=keyboard)
-                om = OrderMessage(order_id=order_id, admin_id=admin_id, message_id=msg.message_id)
-                session.add(om)
-            except Exception as e:
-                print(f"Erreur envoi admin {admin_id}: {e}")
-        session.commit()
-    except Exception as e:
-        session.rollback()
-    finally:
-        session.close()
+        c.execute("""INSERT INTO users (user_id, username, first_name, last_name, first_seen, last_activity, total_orders)
+                     VALUES (?, ?, ?, ?, ?, ?, 0)""",
+                  (user_id, username, first_name, last_name, now, now))
+    
+    conn.commit()
+    conn.close()
 
-# Telegram handlers use SERVICES_CONFIG_IN_MEMORY
+# Telegram handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     username = update.message.from_user.username or f"User_{user_id}"
     first_name = update.message.from_user.first_name or "Utilisateur"
     last_name = update.message.from_user.last_name or ""
+    
     update_user_activity(user_id, username, first_name, last_name)
+    
     keyboard = [
         [InlineKeyboardButton("🎬 Streaming (Netflix, HBO, Disney+...)", callback_data="cat_streaming")],
         [InlineKeyboardButton("🎧 Musique (Spotify, Deezer)", callback_data="cat_music")],
@@ -2330,11 +1574,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🍎 Apple (TV + Music)", callback_data="cat_apple")],
         [InlineKeyboardButton("🏋️ Basic Fit", callback_data="cat_basic_fit")]
     ]
+    
     reply_markup = InlineKeyboardMarkup(keyboard)
-    welcome_text = ("🎯 *Bienvenue sur B4U Deals !*\n\nProfite de nos offres premium à prix réduits :\n• Comptes streaming\n• Abonnements musique\n• Services IA\n• Services Apple\n• Abonnements fitness\n\nChoisis une catégorie pour commencer :")
+    
+    welcome_text = (
+        "🎯 *Bienvenue sur B4U Deals !*\n\n"
+        "Profite de nos offres premium à prix réduits :\n"
+        "• Comptes streaming\n"
+        "• Abonnements musique\n"
+        "• Services IA\n"
+        "• Services Apple\n"
+        "• Abonnements fitness\n\n"
+        "Choisis une catégorie pour commencer :"
+    )
+    
     try:
         image_url = "https://raw.githubusercontent.com/Noallo312/serveur_express_bot/refs/heads/main/514B1CC0-791F-47CA-825C-F82A4100C02E.png"
-        await update.message.reply_photo(photo=image_url, caption=welcome_text, parse_mode='Markdown', reply_markup=reply_markup)
+        await update.message.reply_photo(
+            photo=image_url,
+            caption=welcome_text,
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
     except Exception as e:
         print(f"Erreur chargement image: {e}")
         await update.message.reply_text(welcome_text, parse_mode='Markdown', reply_markup=reply_markup)
@@ -2347,79 +1608,689 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = query.from_user.username or f"User_{user_id}"
     first_name = query.from_user.first_name or "Utilisateur"
     last_name = query.from_user.last_name or ""
+    
     update_user_activity(user_id, username, first_name, last_name)
-
+    
+    # Catégories
     if data.startswith("cat_"):
         category = data.replace("cat_", "")
         keyboard = []
-        for service_key, service_data in SERVICES_CONFIG_IN_MEMORY.items():
+        
+        for service_key, service_data in SERVICES_CONFIG.items():
             if service_data['active'] and service_data.get('visible', True) and service_data['category'] == category:
                 keyboard.append([InlineKeyboardButton(service_data['name'], callback_data=f"service_{service_key}")])
+        
         keyboard.append([InlineKeyboardButton("⬅️ Retour au menu", callback_data="back_to_menu")])
         reply_markup = InlineKeyboardMarkup(keyboard)
-        category_labels = {'streaming': '🎬 Streaming', 'music': '🎧 Musique', 'ai': '🤖 Intelligence Artificielle', 'apple': '🍎 Apple', 'basic_fit': '🏋️ Basic Fit'}
-        await query.edit_message_caption(caption=f"*{category_labels.get(category, category)}*\n\nChoisis ton service :", parse_mode='Markdown', reply_markup=reply_markup)
+        
+        category_labels = {
+            'streaming': '🎬 Streaming',
+            'music': '🎧 Musique',
+            'ai': '🤖 Intelligence Artificielle',
+            'apple': '🍎 Apple',
+            'basic_fit': '🏋️ Basic Fit'
+        }
+        
+        await query.edit_message_caption(
+            caption=f"*{category_labels.get(category, category)}*\n\nChoisis ton service :",
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
         return
-
+    
+    # Services
     if data.startswith("service_"):
         service_key = data.replace("service_", "")
-        service = SERVICES_CONFIG_IN_MEMORY[service_key]
+        service = SERVICES_CONFIG[service_key]
         keyboard = []
+        
         for plan_key, plan_data in service['plans'].items():
-            keyboard.append([InlineKeyboardButton(f"{plan_data['label']} - {plan_data['price']}€", callback_data=f"plan_{service_key}_{plan_key}")])
+            keyboard.append([InlineKeyboardButton(
+                f"{plan_data['label']} - {plan_data['price']}€",
+                callback_data=f"plan_{service_key}_{plan_key}"
+            )])
+        
         keyboard.append([InlineKeyboardButton("⬅️ Retour", callback_data=f"cat_{service['category']}")])
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_caption(caption=f"*{service['name']}*\n\nChoisis ton abonnement :", parse_mode='Markdown', reply_markup=reply_markup)
+        
+        await query.edit_message_caption(
+            caption=f"*{service['name']}*\n\nChoisis ton abonnement :",
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
         return
-
+    
+    # Plans
     if data.startswith("plan_"):
         parts = data.replace("plan_", "").split("_")
         service_key = parts[0]
         plan_key = "_".join(parts[1:])
-        service = SERVICES_CONFIG_IN_MEMORY[service_key]
+        service = SERVICES_CONFIG[service_key]
         plan = service['plans'][plan_key]
-        user_states[user_id] = {'service': service_key, 'plan': plan_key, 'service_name': service['name'], 'plan_label': plan['label'], 'price': plan['price'], 'cost': plan['cost'], 'step': 'waiting_form'}
+        
+        user_states[user_id] = {
+            'service': service_key,
+            'plan': plan_key,
+            'service_name': service['name'],
+            'plan_label': plan['label'],
+            'price': plan['price'],
+            'cost': plan['cost'],
+            'step': 'waiting_form'
+        }
+        
+        # Formulaire Deezer
         if service_key == 'deezer':
-            await query.message.reply_text(f"✅ *Commande confirmée*\n\nService: {service['name']}\nPlan: {plan['label']}\nPrix: {plan['price']}€\n\n📝 Envoie ton nom, prénom et mail (chacun sur une ligne)", parse_mode='Markdown')
+            await query.message.reply_text(
+                f"✅ *Commande confirmée*\n\nService: {service['name']}\nPlan: {plan['label']}\nPrix: {plan['price']}€\n\n📝 Envoie ton nom, prénom et mail (chacun sur une ligne)",
+                parse_mode='Markdown'
+            )
             user_states[user_id]['step'] = 'waiting_deezer_form'
             return
+        
+        # Formulaire standard
         else:
-            form_text = (f"✅ *{plan['label']} - {plan['price']}€*\n\n📝 *Formulaire de commande*\n\nEnvoie-moi les informations suivantes (une par ligne) :\n\n1️⃣ Nom\n2️⃣ Prénom\n3️⃣ Adresse email\n4️⃣ Moyen de paiement (PayPal / Virement / Revolut)\n\n📌 Exemple :\nDupont\nJean\njean.dupont@email.com\nPayPal")
+            form_text = (
+                f"✅ *{plan['label']} - {plan['price']}€*\n\n"
+                "📝 *Formulaire de commande*\n\n"
+                "Envoie-moi les informations suivantes (une par ligne) :\n\n"
+                "1️⃣ Nom\n"
+                "2️⃣ Prénom\n"
+                "3️⃣ Adresse email\n"
+                "4️⃣ Moyen de paiement (PayPal / Virement / Revolut)\n\n"
+                "📌 Exemple :\n"
+                "Dupont\n"
+                "Jean\n"
+                "jean.dupont@email.com\n"
+                "PayPal"
+            )
             await query.message.reply_text(form_text, parse_mode='Markdown')
             return
-
+    
+    # Retour au menu principal
     if data == "back_to_menu":
-        keyboard = [[InlineKeyboardButton("🎬 Streaming (Netflix, HBO, Disney+...)", callback_data="cat_streaming")],[InlineKeyboardButton("🎧 Musique (Spotify, Deezer)", callback_data="cat_music")],[InlineKeyboardButton("🤖 IA (ChatGPT+)", callback_data="cat_ai")],[InlineKeyboardButton("🍎 Apple (TV + Music)", callback_data="cat_apple")],[InlineKeyboardButton("🏋️ Basic Fit", callback_data="cat_basic_fit")]]
+        keyboard = [
+            [InlineKeyboardButton("🎬 Streaming (Netflix, HBO, Disney+...)", callback_data="cat_streaming")],
+            [InlineKeyboardButton("🎧 Musique (Spotify, Deezer)", callback_data="cat_music")],
+            [InlineKeyboardButton("🤖 IA (ChatGPT+)", callback_data="cat_ai")],
+            [InlineKeyboardButton("🍎 Apple (TV + Music)", callback_data="cat_apple")],
+            [InlineKeyboardButton("🏋️ Basic Fit", callback_data="cat_basic_fit")]
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_caption(caption="🎯 *B4U Deals*\n\nChoisis une catégorie :", parse_mode='Markdown', reply_markup=reply_markup)
+        await query.edit_message_caption(
+            caption="🎯 *B4U Deals*\n\nChoisis une catégorie :",
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
         return
 
-    # admin actions handled similarly to previous logic — omitted here for brevity (kept in full file above)
-    # For admin_... callback handling see earlier parts of this file (keeps same behavior as original app).
+    # Actions admin depuis Telegram
+    if data.startswith("admin_"):
+        parts = data.split("_")
+        if len(parts) < 3:
+            await query.answer("Données invalides", show_alert=True)
+            return
+
+        action = parts[1]
+        try:
+            order_id = int(parts[2])
+        except ValueError:
+            await query.answer("ID invalide", show_alert=True)
+            return
+
+        admin_user_id = query.from_user.id
+        admin_username = query.from_user.username or (query.from_user.first_name or "").strip()
+
+        if admin_user_id not in ADMIN_IDS:
+            await query.answer("Non autorisé", show_alert=True)
+            return
+
+        conn = sqlite3.connect('orders.db', check_same_thread=False)
+        c = conn.cursor()
+        c.execute("SELECT service, plan, price, cost, user_id, username, first_name, last_name, email, payment_method, admin_id FROM orders WHERE id=?", (order_id,))
+        row = c.fetchone()
+        if not row:
+            conn.close()
+            await query.answer("Commande introuvable", show_alert=True)
+            return
+        
+        service_name, plan_label, price, cost, order_user_id, order_username, order_first_name, order_last_name, order_email, order_payment, current_admin_id = row
+
+        # Verrouillage
+        if current_admin_id and current_admin_id != admin_user_id and action in ['take', 'complete', 'cancel']:
+            conn.close()
+            await query.answer("❌ Cette commande est déjà prise par un autre admin", show_alert=True)
+            return
+
+        timestamp = datetime.now().strftime('%d/%m/%Y %H:%M')
+        
+        client_info = f"👤 @{order_username}\n" if order_username else f"👤 ID: {order_user_id}\n"
+        client_info += f"👤 {order_first_name} {order_last_name}\n"
+        client_info += f"📧 {order_email}\n"
+        if order_payment:
+            client_info += f"💳 {order_payment}\n"
+        
+        if action == "take":
+            c.execute("UPDATE orders SET status='en_cours', admin_id=?, admin_username=?, taken_at=? WHERE id=?",
+                      (admin_user_id, admin_username, datetime.now().isoformat(), order_id))
+            conn.commit()
+            new_text = (
+                f"🔔 *COMMANDE #{order_id} — PRISE EN CHARGE*\n\n"
+                f"✅ Pris en charge par @{admin_username}\n\n"
+                f"📦 *Service:* {service_name}\n"
+                f"📋 *Plan:* {plan_label}\n"
+                f"💰 *Prix:* {price}€\n"
+                f"💵 *Coût:* {cost}€\n"
+                f"📈 *Bénéfice:* {price - cost}€\n\n"
+                f"*Informations client:*\n"
+                f"{client_info}\n"
+                f"🕒 {timestamp}"
+            )
+            answer_text = "✅ Commande prise en charge"
+            
+            delete_other_admin_notifications(order_id, admin_user_id)
+
+        elif action == "complete":
+            c.execute("UPDATE cumulative_stats SET total_revenue = total_revenue + ?, total_profit = total_profit + ?, last_updated = ? WHERE id=1",
+                      (price, price - cost, datetime.now().isoformat()))
+            
+            c.execute("UPDATE orders SET status='terminee' WHERE id=?", (order_id,))
+            conn.commit()
+            new_text = (
+                f"✅ *COMMANDE #{order_id} — TERMINÉE*\n\n"
+                f"🎉 Traitée par @{admin_username}\n\n"
+                f"📦 *Service:* {service_name}\n"
+                f"📋 *Plan:* {plan_label}\n"
+                f"💰 *Prix:* {price}€\n"
+                f"💵 *Coût:* {cost}€\n"
+                f"📈 *Bénéfice:* {price - cost}€\n\n"
+                f"*Informations client:*\n"
+                f"{client_info}\n"
+                f"🕒 {timestamp}"
+            )
+            answer_text = "✅ Commande terminée"
+
+        elif action == "cancel":
+            c.execute("UPDATE orders SET status='annulee', cancelled_by=?, cancelled_at=? WHERE id=?",
+                      (admin_user_id, datetime.now().isoformat(), order_id))
+            conn.commit()
+            new_text = (
+                f"❌ *COMMANDE #{order_id} — ANNULÉE*\n\n"
+                f"🚫 Annulée par @{admin_username}\n\n"
+                f"📦 *Service:* {service_name}\n"
+                f"📋 *Plan:* {plan_label}\n"
+                f"💰 *Prix:* {price}€\n\n"
+                f"*Informations client:*\n"
+                f"{client_info}\n"
+                f"🕒 {timestamp}"
+            )
+            answer_text = "✅ Commande annulée"
+
+        elif action == "restore":
+            c.execute("UPDATE orders SET status='en_attente', admin_id=NULL, admin_username=NULL, taken_at=NULL, cancelled_by=NULL, cancelled_at=NULL WHERE id=?",
+                      (order_id,))
+            conn.commit()
+            
+            c.execute("DELETE FROM order_messages WHERE order_id=?", (order_id,))
+            conn.commit()
+            conn.close()
+            
+            await resend_order_to_all_admins_async(context, order_id, service_name, plan_label, price, cost, order_username, order_user_id, order_first_name, order_last_name, order_email, order_payment)
+            
+            await query.answer("✅ Commande remise en ligne")
+            return
+
+        else:
+            conn.close()
+            await query.answer("Action inconnue", show_alert=True)
+            return
+
+        try:
+            c.execute("SELECT status FROM orders WHERE id=?", (order_id,))
+            current_status = c.fetchone()[0]
+            
+            keyboard = []
+            if current_status == 'en_attente':
+                keyboard = [[
+                    InlineKeyboardButton("✋ Prendre", callback_data=f"admin_take_{order_id}"),
+                    InlineKeyboardButton("❌ Annuler", callback_data=f"admin_cancel_{order_id}")
+                ]]
+            elif current_status == 'en_cours':
+                keyboard = [[
+                    InlineKeyboardButton("✅ Terminer", callback_data=f"admin_complete_{order_id}"),
+                    InlineKeyboardButton("❌ Annuler", callback_data=f"admin_cancel_{order_id}"),
+                    InlineKeyboardButton("🔄 Remettre", callback_data=f"admin_restore_{order_id}")
+                ]]
+            elif current_status in ['terminee', 'annulee']:
+                keyboard = [[
+                    InlineKeyboardButton("🔄 Remettre en ligne", callback_data=f"admin_restore_{order_id}")
+                ]]
+            
+            await context.bot.edit_message_text(
+                chat_id=admin_user_id,
+                message_id=query.message.message_id,
+                text=new_text,
+                parse_mode='Markdown',
+                reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
+            )
+        except Exception as e:
+            print(f"[edit_message] Erreur: {e}")
+        finally:
+            conn.close()
+
+        await query.answer(answer_text)
+        return
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # This function uses the same logic as previous implementation, adapted to SQLAlchemy models.
-    # Kept full behavior (omitted here for brevity) — it's implemented earlier in the file where forms are handled.
-    # For simplicity, we delegate to the same implementations above.
-    pass
+    user_id = update.message.from_user.id
+    username = update.message.from_user.username or f"User_{user_id}"
+    first_name_tg = update.message.from_user.first_name or ""
+    last_name_tg = update.message.from_user.last_name or ""
+    full_name_tg = f"{first_name_tg} {last_name_tg}".strip() or f"User_{user_id}"
+    text = update.message.text
+    
+    update_user_activity(user_id, username, first_name_tg, last_name_tg)
+    
+    if user_id not in user_states:
+        await update.message.reply_text(
+            "❌ Aucune commande en cours.\n\nUtilise /start pour commencer."
+        )
+        return
+    
+    state = user_states[user_id]
+    
+    # Formulaire Deezer
+    if state.get('step') == 'waiting_deezer_form':
+        lines = text.strip().split('\n')
+        if len(lines) < 3:
+            await update.message.reply_text("❌ Envoie les 3 informations : Nom, Prénom, Mail")
+            return
+        
+        conn = sqlite3.connect('orders.db', check_same_thread=False)
+        c = conn.cursor()
+        c.execute("""INSERT INTO orders 
+                     (user_id, username, service, plan, price, cost, timestamp, status,
+                      first_name, last_name, email)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, 'en_attente', ?, ?, ?)""",
+                  (user_id, username, state['service_name'], state['plan_label'], 
+                   state['price'], state['cost'], datetime.now().isoformat(),
+                   lines[1].strip(), lines[0].strip(), lines[2].strip()))
+        
+        order_id = c.lastrowid
+        
+        c.execute("UPDATE users SET total_orders = total_orders + 1, last_activity = ? WHERE user_id = ?",
+                  (datetime.now().isoformat(), user_id))
+        
+        conn.commit()
+        conn.close()
+
+        # Envoyer aux admins
+        for admin_id in ADMIN_IDS:
+            try:
+                admin_text = f"🔔 *NOUVELLE COMMANDE #{order_id}*\n\n"
+                if update.message.from_user.username:
+                    admin_text += f"👤 @{username}\n"
+                else:
+                    admin_text += f"👤 {full_name_tg} (ID: {user_id})\n"
+                admin_text += (
+                    f"📦 {state['service_name']}\n"
+                    f"💰 {state['price']}€\n"
+                    f"💵 Coût: {state['cost']}€\n"
+                    f"📈 Bénéf: {state['price'] - state['cost']}€\n\n"
+                    f"👤 {lines[1].strip()} {lines[0].strip()}\n"
+                    f"📧 {lines[2].strip()}\n"
+                    f"🕒 {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+                )
+
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✋ Prendre", callback_data=f"admin_take_{order_id}"),
+                    InlineKeyboardButton("❌ Annuler", callback_data=f"admin_cancel_{order_id}")
+                ]])
+
+                msg = await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=admin_text,
+                    parse_mode='Markdown',
+                    reply_markup=keyboard
+                )
+
+                try:
+                    conn2 = sqlite3.connect('orders.db', check_same_thread=False)
+                    c2 = conn2.cursor()
+                    c2.execute("""INSERT INTO order_messages (order_id, admin_id, message_id)
+                                  VALUES (?, ?, ?)""", (order_id, admin_id, msg.message_id))
+                    conn2.commit()
+                    conn2.close()
+                except Exception as e:
+                    print(f"[order_messages insert] Erreur: {e}")
+
+            except Exception as e:
+                print(f"Erreur envoi admin: {e}")
+        
+        await update.message.reply_text(f"✅ *Commande #{order_id} enregistrée !*\n\nMerci ! 🙏", parse_mode='Markdown')
+        del user_states[user_id]
+        return
+    
+    # Formulaire standard
+    if state.get('step') == 'waiting_form':
+        lines = [line.strip() for line in text.strip().split('\n') if line.strip()]
+        
+        if len(lines) < 4:
+            await update.message.reply_text(
+                "❌ *Informations incomplètes*\n\n"
+                "Il me faut les 4 informations :\n"
+                "1️⃣ Nom\n"
+                "2️⃣ Prénom\n"
+                "3️⃣ Email\n"
+                "4️⃣ Moyen de paiement",
+                parse_mode='Markdown'
+            )
+            return
+        
+        last_name = lines[0]
+        first_name = lines[1]
+        email = lines[2]
+        payment_method = lines[3]
+        
+        if '@' not in email:
+            await update.message.reply_text("❌ Email invalide. Recommence avec un email valide.")
+            return
+        
+        payment_methods = ['paypal', 'virement', 'revolut']
+        if payment_method.lower() not in payment_methods:
+            await update.message.reply_text(
+                "❌ Moyen de paiement invalide.\n\n"
+                "Choisis parmi : PayPal, Virement, Revolut"
+            )
+            return
+        
+        conn = sqlite3.connect('orders.db', check_same_thread=False)
+        c = conn.cursor()
+        c.execute("""INSERT INTO orders 
+                     (user_id, username, service, plan, price, cost, timestamp, status,
+                      first_name, last_name, email, payment_method)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, 'en_attente', ?, ?, ?, ?)""",
+                  (user_id, username, state['service_name'], state['plan_label'], 
+                   state['price'], state['cost'], datetime.now().isoformat(),
+                   first_name, last_name, email, payment_method))
+        
+        order_id = c.lastrowid
+        
+        c.execute("UPDATE users SET total_orders = total_orders + 1, last_activity = ? WHERE user_id = ?",
+                  (datetime.now().isoformat(), user_id))
+        
+        conn.commit()
+        conn.close()
+
+        admin_message = (
+            f"🔔 *NOUVELLE COMMANDE #{order_id}*\n\n"
+            f"👤 Client: @{username}\n"
+            f"📦 Service: {state['service_name']}\n"
+            f"📋 Plan: {state['plan_label']}\n"
+            f"💰 Prix: {state['price']}€\n"
+            f"💵 Coût: {state['cost']}€\n"
+            f"📈 Bénéf: {state['price'] - state['cost']}€\n\n"
+            f"*Informations client:*\n"
+            f"👤 {first_name} {last_name}\n"
+            f"📧 {email}\n"
+            f"💳 Paiement: {payment_method}\n\n"
+            f"🕒 {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+        )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✋ Prendre", callback_data=f"admin_take_{order_id}"),
+            InlineKeyboardButton("❌ Annuler", callback_data=f"admin_cancel_{order_id}")
+        ]])
+        
+        for admin_id in ADMIN_IDS:
+            try:
+                msg = await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=admin_message,
+                    parse_mode='Markdown',
+                    reply_markup=keyboard
+                )
+                try:
+                    conn2 = sqlite3.connect('orders.db', check_same_thread=False)
+                    c2 = conn2.cursor()
+                    c2.execute("""INSERT INTO order_messages (order_id, admin_id, message_id)
+                                  VALUES (?, ?, ?)""", (order_id, admin_id, msg.message_id))
+                    conn2.commit()
+                    conn2.close()
+                except Exception as e:
+                    print(f"[order_messages insert] Erreur: {e}")
+            except Exception as e:
+                print(f"[ERREUR] Notification admin {admin_id}: {e}")
+        
+        confirmation_message = (
+            f"✅ *Commande #{order_id} enregistrée !*\n\n"
+            f"📦 {state['plan_label']}\n"
+            f"💰 Montant: {state['price']}€\n"
+            f"💳 Paiement: {payment_method}\n\n"
+            f"Nous traitons ta commande rapidement.\n"
+            f"Tu seras notifié dès qu'elle sera prête ! 🚀\n\n"
+            f"Merci de ta confiance ! 🙏"
+        )
+        
+        await update.message.reply_text(confirmation_message, parse_mode='Markdown')
+        
+        del user_states[user_id]
+        return
+
+# Helper functions
+def delete_other_admin_notifications(order_id: int, keeping_admin_id: int):
+    if not BOT_TOKEN:
+        return
+
+    conn = sqlite3.connect('orders.db', check_same_thread=False)
+    c = conn.cursor()
+    try:
+        c.execute("SELECT admin_id, message_id FROM order_messages WHERE order_id=? AND admin_id!=?", (order_id, keeping_admin_id))
+        rows = c.fetchall()
+        for admin_chat_id, message_id in rows:
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage",
+                    json={
+                        "chat_id": admin_chat_id,
+                        "message_id": message_id
+                    },
+                    timeout=10
+                )
+            except Exception as e:
+                print(f"[delete_message] Erreur admin {admin_chat_id} msg {message_id}: {e}")
+        
+        c.execute("DELETE FROM order_messages WHERE order_id=? AND admin_id!=?", (order_id, keeping_admin_id))
+        conn.commit()
+    except Exception as e:
+        print("Erreur delete_other_admin_notifications:", e)
+    finally:
+        conn.close()
+
+def edit_admin_notification(order_id: int, admin_id: int, new_text: str):
+    if not BOT_TOKEN:
+        return
+
+    conn = sqlite3.connect('orders.db', check_same_thread=False)
+    c = conn.cursor()
+    try:
+        c.execute("SELECT message_id FROM order_messages WHERE order_id=? AND admin_id=?", (order_id, admin_id))
+        row = c.fetchone()
+        if row:
+            message_id = row[0]
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText",
+                    json={
+                        "chat_id": admin_id,
+                        "message_id": message_id,
+                        "text": new_text,
+                        "parse_mode": "Markdown"
+                    },
+                    timeout=10
+                )
+            except Exception as e:
+                print(f"[edit_message] Erreur admin {admin_id} msg {message_id}: {e}")
+    except Exception as e:
+        print("Erreur edit_admin_notification:", e)
+    finally:
+        conn.close()
+
+def edit_all_admin_notifications(order_id: int, new_text: str):
+    if not BOT_TOKEN:
+        return
+
+    conn = sqlite3.connect('orders.db', check_same_thread=False)
+    c = conn.cursor()
+    try:
+        c.execute("SELECT admin_id, message_id FROM order_messages WHERE order_id=?", (order_id,))
+        rows = c.fetchall()
+        for admin_chat_id, message_id in rows:
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText",
+                    json={
+                        "chat_id": admin_chat_id,
+                        "message_id": message_id,
+                        "text": new_text,
+                        "parse_mode": "Markdown"
+                    },
+                    timeout=10
+                )
+            except Exception as e:
+                print(f"[edit_message] Erreur admin {admin_chat_id} msg {message_id}: {e}")
+    except Exception as e:
+        print("Erreur edit_all_admin_notifications:", e)
+    finally:
+        conn.close()
+
+def resend_order_to_all_admins(order_id: int):
+    if not BOT_TOKEN:
+        return
+
+    conn = sqlite3.connect('orders.db', check_same_thread=False)
+    c = conn.cursor()
+    try:
+        c.execute("SELECT service, plan, price, cost, username, user_id, first_name, last_name, email, payment_method FROM orders WHERE id=?", (order_id,))
+        row = c.fetchone()
+        if not row:
+            return
+        
+        service_name, plan_label, price, cost, username, user_id, first_name, last_name, email, payment_method = row
+        
+        admin_text = f"🔔 *COMMANDE #{order_id} REMISE EN LIGNE*\n\n"
+        if username:
+            admin_text += f"👤 @{username}\n"
+        else:
+            admin_text += f"👤 ID: {user_id}\n"
+        admin_text += (
+            f"📦 {service_name}\n"
+            f"📋 {plan_label}\n"
+            f"💰 {price}€\n"
+            f"💵 Coût: {cost}€\n"
+            f"📈 Bénéf: {price - cost}€\n\n"
+            f"👤 {first_name} {last_name}\n"
+            f"📧 {email}\n"
+        )
+        if payment_method:
+            admin_text += f"💳 {payment_method}\n"
+        admin_text += f"\n🕒 {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+
+        keyboard = [[
+            {"text": "✋ Prendre", "callback_data": f"admin_take_{order_id}"},
+            {"text": "❌ Annuler", "callback_data": f"admin_cancel_{order_id}"}
+        ]]
+
+        for admin_id in ADMIN_IDS:
+            try:
+                response = requests.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                    json={
+                        "chat_id": admin_id,
+                        "text": admin_text,
+                        "parse_mode": "Markdown",
+                        "reply_markup": {"inline_keyboard": keyboard}
+                    },
+                    timeout=10
+                )
+                result = response.json()
+                if result.get('ok'):
+                    message_id = result['result']['message_id']
+                    c.execute("INSERT INTO order_messages (order_id, admin_id, message_id) VALUES (?, ?, ?)",
+                              (order_id, admin_id, message_id))
+            except Exception as e:
+                print(f"Erreur envoi admin {admin_id}: {e}")
+        
+        conn.commit()
+    except Exception as e:
+        print("Erreur resend_order_to_all_admins:", e)
+    finally:
+        conn.close()
+
+async def resend_order_to_all_admins_async(context, order_id, service_name, plan_label, price, cost, username, user_id, first_name, last_name, email, payment_method):
+    admin_text = f"🔔 *COMMANDE #{order_id} REMISE EN LIGNE*\n\n"
+    if username:
+        admin_text += f"👤 @{username}\n"
+    else:
+        admin_text += f"👤 ID: {user_id}\n"
+    admin_text += (
+        f"📦 {service_name}\n"
+        f"📋 {plan_label}\n"
+        f"💰 {price}€\n"
+        f"💵 Coût: {cost}€\n"
+        f"📈 Bénéf: {price - cost}€\n\n"
+        f"👤 {first_name} {last_name}\n"
+        f"📧 {email}\n"
+    )
+    if payment_method:
+        admin_text += f"💳 {payment_method}\n"
+    admin_text += f"\n🕒 {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✋ Prendre", callback_data=f"admin_take_{order_id}"),
+        InlineKeyboardButton("❌ Annuler", callback_data=f"admin_cancel_{order_id}")
+    ]])
+
+    conn = sqlite3.connect('orders.db', check_same_thread=False)
+    c = conn.cursor()
+    
+    for admin_id in ADMIN_IDS:
+        try:
+            msg = await context.bot.send_message(
+                chat_id=admin_id,
+                text=admin_text,
+                parse_mode='Markdown',
+                reply_markup=keyboard
+            )
+            c.execute("INSERT INTO order_messages (order_id, admin_id, message_id) VALUES (?, ?, ?)",
+                      (order_id, admin_id, msg.message_id))
+        except Exception as e:
+            print(f"Erreur envoi admin {admin_id}: {e}")
+    
+    conn.commit()
+    conn.close()
 
 # BOT TELEGRAM MAIN
 def run_bot():
     if not BOT_TOKEN:
         print("BOT_TOKEN non défini")
         return
+
+    # Créer un nouvel event loop pour ce thread
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+
     application = ApplicationBuilder().token(BOT_TOKEN).build()
+    
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+    
     print("🤖 Bot Telegram démarré")
     application.run_polling(drop_pending_updates=True, stop_signals=None)
 
 if __name__ == '__main__':
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
+    
     port = int(os.getenv('PORT', 10000))
     print(f"🌐 Serveur Flask démarré sur le port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
